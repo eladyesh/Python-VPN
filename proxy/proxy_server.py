@@ -1,83 +1,101 @@
 import socket
-import select
 import threading
-import requests
+import select
 
 
-class ProxyServer:
-    def __init__(self, host='localhost', port=8080):
-        self.host = host
-        self.port = port
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.socket.bind((self.host, self.port))
-        self.socket.listen(10)
-        self.tunnel_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.tunnel_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.tunnel_socket.bind((self.host, 0))
-        self.tunnel_socket.listen(10)
+class Proxy:
+    def __init__(self, proxy_host, proxy_port):
+        self.proxy_host = proxy_host
+        self.proxy_port = proxy_port
 
-    def handle_client(self, client_socket, remote_socket):
+    def handle_client(self, connection):
+        # receive data from client
+        data = connection.recv(4096)
+
+        # determine whether request is for HTTP or HTTPS
+        is_https = data.startswith(b"CONNECT")
+
+        # if request is for HTTPS, establish a tunnel to the remote host
+        if is_https:
+            try:
+                # get remote host and port from the request
+                remote_host, remote_port = data.split(b" ")[1].split(b":")
+                remote_port = int(remote_port)
+
+                # connect to the remote host and port
+                remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                remote.connect((remote_host, remote_port))
+
+                # send "200 Connection established" response to client
+                connection.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+
+                # start data exchange between client and remote
+                self.exchange_loop(connection, remote)
+            except Exception as e:
+                # return "502 Bad Gateway" error to client
+                connection.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                connection.close()
+        else:
+            try:
+                # get remote host and port from the HTTP request
+                remote_host, remote_port = self.get_remote_host_port(data)
+
+                # connect to the remote host and port
+                remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                remote.connect((remote_host, remote_port))
+
+                # send the HTTP request to the remote server
+                remote.sendall(data)
+
+                # start data exchange between client and remote
+                self.exchange_loop(connection, remote)
+            except Exception as e:
+                # return "500 Internal Server Error" to client
+                connection.sendall(b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
+                connection.close()
+
+    def exchange_loop(self, client, remote):
         while True:
-            r, _, _ = select.select([client_socket, remote_socket], [], [], 10)
-            if not r:
-                break
+            # wait until client or remote is available for read
+            r, w, e = select.select([client, remote], [], [])
 
-            for source, dest in [(client_socket, remote_socket), (remote_socket, client_socket)]:
-                try:
-                    data = source.recv(4096)
-                    if data:
-                        dest.sendall(data)
-                    else:
-                        break
-                except:
+            if client in r:
+                data = client.recv(4096)
+                if remote.send(data) <= 0:
                     break
 
-        client_socket.close()
-        remote_socket.close()
+            if remote in r:
+                data = remote.recv(4096)
+                if client.send(data) <= 0:
+                    break
 
-    def handle_tunnel(self, client_socket, remote_host, remote_port):
-        remote_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        remote_socket.connect((remote_host, remote_port))
+    def get_remote_host_port(self, data):
+        # parse the HTTP request to get the remote host and port
+        host_start = data.find(b"Host: ") + 6
+        host_end = data.find(b"\r\n", host_start)
+        host = data[host_start:host_end].decode("utf-8")
 
-        response = 'HTTP/1.1 200 Connection Established\r\nProxy-agent: PyProxy\r\n\r\n'
-        client_socket.sendall(response.encode())
+        port = 80
+        if ":" in host:
+            host, port = host.split(":")
+            port = int(port)
 
-        t1 = threading.Thread(target=self.handle_client, args=(client_socket, remote_socket))
-        t2 = threading.Thread(target=self.handle_client, args=(remote_socket, client_socket))
-        t1.start()
-        t2.start()
+        return host, port
 
-    def handle_request(self, client_socket, addr):
-        data = client_socket.recv(4096)
-        if not data:
-            return
+    def run(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind((self.proxy_host, self.proxy_port))
+        s.listen()
 
-        first_line = data.decode().split('\r\n')[0]
-        url = first_line.split(' ')[1]
-
-        if url.startswith('https://'):
-            remote_host, remote_port = url[8:].split(':')
-            remote_port = int(remote_port)
-
-            tunnel_client_socket, _ = self.tunnel_socket.accept()
-            self.handle_tunnel(tunnel_client_socket, remote_host, remote_port)
-        else:
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers)
-            client_socket.sendall(response.content)
-
-        client_socket.close()
-
-    def serve_forever(self):
-        print(f'Listening on {self.host}:{self.port}')
+        print(f"* HTTP proxy server is running on {self.proxy_host}:{self.proxy_port}")
 
         while True:
-            client_socket, addr = self.socket.accept()
-            t = threading.Thread(target=self.handle_request, args=(client_socket, addr))
+            conn, addr = s.accept()
+            print(f"* new connection from {addr}")
+            t = threading.Thread(target=self.handle_client, args=(conn,))
             t.start()
 
 
-if __name__ == '__main__':
-    proxy = ProxyServer()
-    proxy.serve_forever()
+if __name__ == "__main__":
+    proxy = Proxy("127.0.0.1", 8080)
+    proxy.run()
